@@ -1,0 +1,4 @@
+# Candidates, not verified results. One ATS board or job URL per line.
+https://jobs.lever.co/levelai
+https://jobs.ashbyhq.com/notion
+https://job-boards.greenhouse.io/razorpay
