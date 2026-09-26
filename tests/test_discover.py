@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import discover
-from discover import board_from_url, india_jobs, india_location, parse_board
+from discover import board_from_url, candidates_from_dataset, candidates_from_india_yaml, india_jobs, india_location, parse_board
 
 
 class DiscoveryTests(unittest.TestCase):
@@ -21,6 +21,36 @@ class DiscoveryTests(unittest.TestCase):
         self.assertTrue(india_location({"postalAddress": {"addressCountry": "IN", "addressLocality": "Bengaluru"}}))
         self.assertFalse(india_location("Remote — Anywhere"))
         self.assertFalse(india_location({"addressCountry": "US", "addressLocality": "India Street"}))
+
+    def test_public_dataset_supplies_only_direct_india_ats_candidates(self):
+        rows = [
+            {"name": "A", "countries": ["India"], "ats_links": ["https://boards.greenhouse.io/alpha/jobs/3"],
+             "list_urls": ["https://www.linkedin.com/jobs/view/3"]},
+            {"name": "B", "countries": ["United States"], "ats_links": ["https://jobs.lever.co/bravo"]},
+            {"name": "C", "countries": ["India"], "list_urls": ["https://jobs.ashbyhq.com/charlie"]},
+        ]
+        self.assertEqual(candidates_from_dataset({"companies": rows}), [
+            "https://boards.greenhouse.io/alpha/jobs/3", "https://jobs.ashbyhq.com/charlie",
+        ])
+
+    def test_india_yaml_accepts_provider_slugs_and_direct_urls(self):
+        content = """
+greenhouse:
+  - name: Alpha
+    slug: alpha
+lever:
+  Beta: beta
+tracked_companies:
+  - name: Charlie
+    provider: ashby
+    slug: charlie
+  - name: Delta
+    careers_url: https://jobs.lever.co/delta
+"""
+        self.assertEqual(candidates_from_india_yaml(content), [
+            "https://job-boards.greenhouse.io/alpha", "https://jobs.lever.co/beta",
+            "https://jobs.ashbyhq.com/charlie", "https://jobs.lever.co/delta",
+        ])
 
     def test_provider_feeds(self):
         ashby = {"ats": "ashby"}
@@ -38,15 +68,17 @@ class DiscoveryTests(unittest.TestCase):
                 "STATE": root / "discovery_state.json", "SEEDS": root / "seeds.txt",
             }
             with patch.multiple(discover, **paths), patch.dict("os.environ", {"BRAVE_SEARCH_API_KEY": ""}):
-                with patch.object(discover, "get_json", return_value=[
-                    {"id": "1", "hostedUrl": "https://jobs.lever.co/acme/1",
-                     "categories": {"location": "Bengaluru, India"}},
-                ]):
-                    discover.main()
+                dataset = [{"name": "Acme", "countries": ["India"], "ats_links": ["https://jobs.lever.co/acme"]}]
+                feed = [{"id": "1", "hostedUrl": "https://jobs.lever.co/acme/1",
+                         "categories": {"location": "Bengaluru, India"}}]
+                with patch.object(discover, "get_text", return_value="lever:\n  - acme\n"):
+                    with patch.object(discover, "get_json", side_effect=[dataset, feed]):
+                        discover.main()
                 self.assertEqual(len(discover.read_csv(paths["COMPANIES"])), 1)
                 self.assertEqual(len(discover.read_csv(paths["BOARDS"])), 1)
-                with patch.object(discover, "get_json", side_effect=TimeoutError("temporary")):
-                    discover.main()
+                with patch.object(discover, "get_text", return_value="lever:\n  - acme\n"):
+                    with patch.object(discover, "get_json", side_effect=[dataset, TimeoutError("temporary")]):
+                        discover.main()
                 self.assertEqual(len(discover.read_csv(paths["COMPANIES"])), 1)
         lever = {"ats": "lever"}
         self.assertEqual(india_jobs(lever, [{"id": "1", "hostedUrl": "https://jobs.lever.co/x/1",
