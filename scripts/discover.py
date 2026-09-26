@@ -1,8 +1,9 @@
 """Discover public ATS boards and retain companies with a live India job.
 
-No external Python dependencies. BRAVE_SEARCH_API_KEY enables ongoing discovery.
-Only provider-owned JSON endpoints are requested; candidate URLs are parsed,
-never fetched. Errors leave prior verified rows intact for the next run.
+An India-filtered public company dataset supplies candidates without an API key.
+BRAVE_SEARCH_API_KEY adds ongoing web discovery. Candidate ATS URLs are parsed,
+never fetched; only provider-owned JSON endpoints verify live jobs. Errors
+leave prior verified rows intact for the next run.
 """
 
 import csv
@@ -19,27 +20,29 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlparse
 from urllib.request import Request, urlopen
 
+import yaml
+
 
 ROOT = Path(__file__).resolve().parents[1]
 COMPANIES = ROOT / "companies.csv"
 BOARDS = ROOT / "boards.csv"
 STATE = ROOT / "discovery_state.json"
 SEEDS = ROOT / "seeds.txt"
+PUBLIC_DATASET = "https://raw.githubusercontent.com/outscal/OpenJobs/main/data/companies_v2.json"
+PUBLIC_INDIA_LIST = "https://raw.githubusercontent.com/AnojSKunte/career-ops-india/main/portals/india.yml"
 COMPANY_FIELDS = ["company", "ats", "career_page", "india_jobs", "last_verified_utc"]
 BOARD_FIELDS = ["ats", "slug", "career_page", "first_seen_utc", "last_checked_utc"]
 QUERIES = [
     'site:jobs.ashbyhq.com "India"',
-    'site:jobs.ashbyhq.com "Bengalore"',
+    'site:jobs.ashbyhq.com "Bengaluru"',
     'site:jobs.ashbyhq.com "Hyderabad"',
     'site:jobs.lever.co "India"',
     'site:jobs.lever.co "Pune"',
     'site:jobs.lever.co "Bangalore"',
-    'site:jobs.lever.co "Hyderabad"',
     'site:boards.greenhouse.io "India"',
     'site:job-boards.greenhouse.io "India"',
-    'site:job-boards.greenhouse.io "pune"',
-    'site:boards.greenhouse.io "Bangalore"',
-    'site:boards.greenhouse.io "Hyderabad"',
+    'site:job-boards.greenhouse.io "Mumbai"',
+    'site:boards.greenhouse.io "Chennai"',
 ]
 INDIA = re.compile(r"\b(india|bharat|bengaluru|bangalore|hyderabad|pune|mumbai|chennai|gurugram|gurgaon|noida|new delhi|delhi|kolkata|kochi|cochin|ahmedabad|jaipur)\b", re.I)
 
@@ -48,20 +51,32 @@ def now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def get_json(url, headers=None):
+def get_json(url, headers=None, max_bytes=32_000_000):
     request = Request(url, headers={"User-Agent": "JobSiftPersonalDiscovery/1.0", "Accept": "application/json", **(headers or {})})
     for attempt in range(3):
         try:
             with urlopen(request, timeout=18) as response:
-                if int(response.headers.get("Content-Length", "0")) > 12_000_000:
+                if int(response.headers.get("Content-Length", "0")) > max_bytes:
                     raise ValueError("Response too large")
-                return json.load(io.TextIOWrapper(io.BytesIO(response.read(12_000_001)), encoding="utf-8"))
+                payload = response.read(max_bytes + 1)
+                if len(payload) > max_bytes:
+                    raise ValueError("Response too large")
+                return json.load(io.TextIOWrapper(io.BytesIO(payload), encoding="utf-8"))
         except (HTTPError, URLError, TimeoutError) as exc:
             if isinstance(exc, HTTPError) and exc.code not in (429, 500, 502, 503, 504):
                 raise
             if attempt == 2:
                 raise
             time.sleep(1 + attempt * 2)
+
+
+def get_text(url, max_bytes=2_000_000):
+    request = Request(url, headers={"User-Agent": "JobSiftPersonalDiscovery/1.0"})
+    with urlopen(request, timeout=18) as response:
+        payload = response.read(max_bytes + 1)
+    if len(payload) > max_bytes:
+        raise ValueError("Public list too large")
+    return payload.decode("utf-8-sig")
 
 
 def parse_board(url):
@@ -125,6 +140,72 @@ def discover_search(api_key, start, count=2):
             print(f"Search failed for {query}: {exc}", file=sys.stderr)
         time.sleep(1)
     return candidates
+
+
+def candidates_from_dataset(records):
+    """Import only direct ATS links for companies historically seen hiring in India.
+
+    The source is a candidate list. Each board still needs a current India job
+    from its own ATS feed before it enters companies.csv.
+    """
+    if isinstance(records, dict):
+        records = records.get("companies") or records.get("data")
+    if not isinstance(records, list):
+        raise ValueError("Unexpected public dataset format")
+    candidates = []
+    for company in records:
+        if not isinstance(company, dict):
+            continue
+        countries = company.get("countries") or []
+        if not isinstance(countries, list) or not any(isinstance(c, str) and c.casefold() == "india" for c in countries):
+            continue
+        for field in ("ats_links", "list_urls"):
+            links = company.get(field) or []
+            if isinstance(links, str):
+                links = [links]
+            if isinstance(links, list):
+                candidates.extend(link for link in links if isinstance(link, str) and parse_board(link))
+    return candidates
+
+
+def candidates_from_india_yaml(content):
+    """Accept ATS board URLs or provider/slug entries from a public YAML list."""
+    document = yaml.safe_load(content)
+    candidates = []
+    hosts = {
+        "ashby": "jobs.ashbyhq.com",
+        "lever": "jobs.lever.co",
+        "greenhouse": "job-boards.greenhouse.io",
+    }
+
+    def walk(node, provider=None, slug_value=False):
+        if isinstance(node, str):
+            if parse_board(node):
+                candidates.append(node)
+            elif slug_value and provider in hosts and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,100}", node):
+                candidates.append(f"https://{hosts[provider]}/{node}")
+        elif isinstance(node, list):
+            for value in node:
+                walk(value, provider, slug_value)
+        elif isinstance(node, dict):
+            declared = str(node.get("ats") or node.get("provider") or node.get("source") or "").lower()
+            provider = declared if declared in hosts else provider
+            is_record = any(k in node for k in ("slug", "board", "board_token", "site", "ats", "provider", "source", "name"))
+            for field in ("slug", "board", "board_token", "site"):
+                if isinstance(node.get(field), str):
+                    walk(node[field], provider, True)
+            for field in ("url", "careers_url", "board_url"):
+                if isinstance(node.get(field), str):
+                    walk(node[field])
+            for field, value in node.items():
+                if field in ("slug", "board", "board_token", "site", "url", "careers_url", "board_url",
+                             "ats", "provider", "source", "name", "description", "id"):
+                    continue
+                child_provider = str(field).lower() if str(field).lower() in hosts else provider
+                walk(value, child_provider, str(field).lower() in hosts or (slug_value and not is_record))
+
+    walk(document)
+    return list(dict.fromkeys(candidates))
 
 
 def india_location(value):
@@ -192,12 +273,31 @@ def main():
     state = json.loads(STATE.read_text()) if STATE.exists() else {"next_query": 0}
     candidates = [r.get("career_page", "") for r in existing_boards.values()]
     candidates += [line.strip() for line in SEEDS.read_text().splitlines() if line.strip() and not line.startswith("#")]
+    source_ok = False
+    try:
+        public_candidates = candidates_from_dataset(get_json(PUBLIC_DATASET))
+        if not public_candidates:
+            raise ValueError("Dataset contained no supported India ATS links; check upstream schema")
+        candidates += public_candidates
+        source_ok = True
+        print(f"Public India dataset supplied {len(public_candidates)} ATS links before deduplication")
+    except Exception as exc:
+        print(f"Public dataset unavailable; retaining saved boards and seeds: {exc}", file=sys.stderr)
+    try:
+        india_candidates = candidates_from_india_yaml(get_text(PUBLIC_INDIA_LIST))
+        if not india_candidates:
+            raise ValueError("India YAML list contained no supported ATS boards")
+        candidates += india_candidates
+        source_ok = True
+        print(f"India ATS list supplied {len(india_candidates)} boards before deduplication")
+    except Exception as exc:
+        print(f"India ATS list unavailable; retaining other candidates: {exc}", file=sys.stderr)
     search_key = os.environ.get("BRAVE_SEARCH_API_KEY", "").strip()
     if search_key:
         candidates += discover_search(search_key, state["next_query"])
         state["next_query"] = (state["next_query"] + 2) % len(QUERIES)
     else:
-        print("No BRAVE_SEARCH_API_KEY: checking saved and seed boards only")
+        print("No BRAVE_SEARCH_API_KEY: checking public dataset, saved boards and seeds only")
 
     for url in candidates:
         board = board_from_url(url)
@@ -236,7 +336,13 @@ def main():
     write_csv(BOARDS, BOARD_FIELDS, sorted(boards, key=lambda b: (b["ats"], b["slug"].lower())))
     write_csv(COMPANIES, COMPANY_FIELDS, sorted(companies.values(), key=lambda c: (c["company"].lower(), c["ats"])))
     STATE.write_text(json.dumps(state, sort_keys=True) + "\n")
-    print(f"Checked {checked}/{min(len(boards), max_boards)} boards; {len(companies)} verified India companies; {len(boards)} candidate boards")
+    summary = f"Checked {checked}/{min(len(boards), max_boards)} boards; {len(companies)} verified India companies; {len(boards)} candidate boards; public list discovery {'OK' if source_ok else 'FAILED'}"
+    print(summary)
+    if os.environ.get("GITHUB_STEP_SUMMARY"):
+        with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as report:
+            report.write("## India ATS discovery\n\n" + summary + "\n")
+    if not source_ok and not search_key:
+        raise RuntimeError("No keyless discovery source available; see public list errors above")
 
 
 if __name__ == "__main__":
