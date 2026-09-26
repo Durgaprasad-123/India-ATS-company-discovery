@@ -29,15 +29,17 @@ COMPANY_FIELDS = ["company", "ats", "career_page", "india_jobs", "last_verified_
 BOARD_FIELDS = ["ats", "slug", "career_page", "first_seen_utc", "last_checked_utc"]
 QUERIES = [
     'site:jobs.ashbyhq.com "India"',
-    'site:jobs.ashbyhq.com "Bengaluru"',
+    'site:jobs.ashbyhq.com "Bengalore"',
     'site:jobs.ashbyhq.com "Hyderabad"',
     'site:jobs.lever.co "India"',
     'site:jobs.lever.co "Pune"',
     'site:jobs.lever.co "Bangalore"',
+    'site:jobs.lever.co "Hyderabad"',
     'site:boards.greenhouse.io "India"',
     'site:job-boards.greenhouse.io "India"',
-    'site:job-boards.greenhouse.io "Mumbai"',
-    'site:boards.greenhouse.io "Chennai"',
+    'site:job-boards.greenhouse.io "pune"',
+    'site:boards.greenhouse.io "Bangalore"',
+    'site:boards.greenhouse.io "Hyderabad"',
 ]
 INDIA = re.compile(r"\b(india|bharat|bengaluru|bangalore|hyderabad|pune|mumbai|chennai|gurugram|gurgaon|noida|new delhi|delhi|kolkata|kochi|cochin|ahmedabad|jaipur)\b", re.I)
 
