@@ -20,8 +20,6 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlparse
 from urllib.request import Request, urlopen
 
-import yaml
-
 
 ROOT = Path(__file__).resolve().parents[1]
 COMPANIES = ROOT / "companies.csv"
@@ -169,8 +167,11 @@ def candidates_from_dataset(records):
 
 
 def candidates_from_india_yaml(content):
-    """Accept ATS board URLs or provider/slug entries from a public YAML list."""
-    document = yaml.safe_load(content)
+    """Read ATS URL and provider/slug entries without a third-party YAML module.
+
+This extracts only the small fields needed from the public list, not arbitrary
+YAML. Unrecognized entries are skipped and the other JSON source still works.
+"""
     candidates = []
     hosts = {
         "ashby": "jobs.ashbyhq.com",
@@ -178,33 +179,60 @@ def candidates_from_india_yaml(content):
         "greenhouse": "job-boards.greenhouse.io",
     }
 
-    def walk(node, provider=None, slug_value=False):
-        if isinstance(node, str):
-            if parse_board(node):
-                candidates.append(node)
-            elif slug_value and provider in hosts and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,100}", node):
-                candidates.append(f"https://{hosts[provider]}/{node}")
-        elif isinstance(node, list):
-            for value in node:
-                walk(value, provider, slug_value)
-        elif isinstance(node, dict):
-            declared = str(node.get("ats") or node.get("provider") or node.get("source") or "").lower()
-            provider = declared if declared in hosts else provider
-            is_record = any(k in node for k in ("slug", "board", "board_token", "site", "ats", "provider", "source", "name"))
-            for field in ("slug", "board", "board_token", "site"):
-                if isinstance(node.get(field), str):
-                    walk(node[field], provider, True)
-            for field in ("url", "careers_url", "board_url"):
-                if isinstance(node.get(field), str):
-                    walk(node[field])
-            for field, value in node.items():
-                if field in ("slug", "board", "board_token", "site", "url", "careers_url", "board_url",
-                             "ats", "provider", "source", "name", "description", "id"):
-                    continue
-                child_provider = str(field).lower() if str(field).lower() in hosts else provider
-                walk(value, child_provider, str(field).lower() in hosts or (slug_value and not is_record))
+    def add(provider, slug):
+        slug = slug.strip().strip("'\"{},[] ")
+        if provider in hosts and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,100}", slug):
+            candidates.append(f"https://{hosts[provider]}/{slug}")
 
-    walk(document)
+    section_provider = None
+    section_indent = -1
+    entry_provider = None
+    entry_slug = None
+
+    def flush():
+        if entry_provider and entry_slug:
+            add(entry_provider, entry_slug)
+
+    for raw in content.splitlines():
+        line = raw.split(" #", 1)[0]
+        value = line.strip()
+        if not value or value.startswith("#"):
+            continue
+        for match in re.finditer(
+            r"https://(?:jobs\.ashbyhq\.com|jobs\.lever\.co|boards\.greenhouse\.io|job-boards\.greenhouse\.io)/[A-Za-z0-9_.-]+",
+            value, re.I,
+        ):
+            candidates.append(match.group(0))
+        indent = len(line) - len(line.lstrip())
+        section = re.fullmatch(r"(?:-\s*)?(ashby|lever|greenhouse):", value, re.I)
+        if section:
+            flush()
+            section_provider = section.group(1).lower()
+            section_indent = indent
+            entry_provider, entry_slug = section_provider, None
+            continue
+        if indent <= section_indent:
+            flush()
+            section_provider, section_indent = None, -1
+            entry_provider, entry_slug = None, None
+
+        if value.startswith("- "):
+            flush()
+            entry_provider, entry_slug = section_provider, None
+            bare = value[2:].strip().strip("'\"")
+            if section_provider and ":" not in bare and not bare.startswith("https://"):
+                add(section_provider, bare)
+
+        declared = re.search(r"\b(?:ats|provider|source):\s*['\"]?(ashby|lever|greenhouse)\b", value, re.I)
+        if declared:
+            entry_provider = declared.group(1).lower()
+        slug = re.search(r"\b(?:slug|board_token|board|site):\s*['\"]?([A-Za-z0-9][A-Za-z0-9_.-]{0,100})", value, re.I)
+        if slug:
+            entry_slug = slug.group(1)
+        mapping = re.fullmatch(r"([A-Za-z0-9_. -]+):\s*['\"]?([A-Za-z0-9][A-Za-z0-9_.-]{0,100})['\"]?", value.removeprefix("- "))
+        if section_provider and mapping and mapping.group(1).lower() not in ("slug", "board", "site", "name", "location", "enabled"):
+            add(section_provider, mapping.group(2))
+    flush()
     return list(dict.fromkeys(candidates))
 
 
